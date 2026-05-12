@@ -99,7 +99,7 @@ static const uint8_t  SERVO_LEDC_CHANNEL  = 0;   // used only on Arduino-ESP32 v
 // COMPILE-TIME CONSTANTS
 // ============================================================================
 
-#define MAX_TEST_STEPS      64    // Max G-code steps per sequence
+#define MAX_TEST_STEPS      128   // Max G-code steps per sequence
 #define LC_INDEX_SIZE       10    // HX711_MP multipoint calibration slots
 #define NUM_NAMED_POS        4    // XA, XB, XC, XD
 #define NUM_NAMED_SERVO_POS  4    // SA, SB, SC, SD
@@ -108,7 +108,7 @@ static const uint8_t  SERVO_LEDC_CHANNEL  = 0;   // used only on Arduino-ESP32 v
 
 #define NVS_MAGIC        0xC0BEEF02u
 #define NVS_VERSION      5u          // bumped: added servo + break-beam config fields
-#define SEQ_MAGIC        0x5E900005u // bumped: added SERVO_MOVE, WAIT_BB, labels
+#define SEQ_MAGIC        0x5E900006u // bumped: added IF/FOR/WHILE control flow
 
 #define LC_RING_CAP      512
 #define SEQ_NVS_KEY_HDR  "seq_hdr"
@@ -120,8 +120,33 @@ static const uint8_t  SERVO_LEDC_CHANNEL  = 0;   // used only on Arduino-ESP32 v
 
 enum class Mode     : uint8_t { SETUP=0, ADJUSTMENTS=1, LIVE_TEST=2 };
 enum class RunState : uint8_t { IDLE=0, RUNNING=1, PAUSED=2, COMPLETE=3 };
-enum class StepType : uint8_t { MOVE=0, DWELL=1, READ_LC=2, SEEK_FORCE=3, PAUSE=4,
-                               SERVO_MOVE=5, WAIT_BB=6 };
+enum class StepType : uint8_t {
+  MOVE=0, DWELL=1, READ_LC=2, SEEK_FORCE=3, PAUSE=4,
+  SERVO_MOVE=5, WAIT_BB=6,
+  COND_JUMP=7,   // conditional jump (IF / WHILE exit check)
+  JUMP=8,        // unconditional jump (ELSE skip-over / ENDWHILE back-jump)
+  LOOP_INIT=9,   // FOR loop start (init counter, exit if exhausted)
+  LOOP_NEXT=10   // FOR loop end (decrement counter, jump back if more iters)
+};
+
+// Condition source for IF / WHILE / FOR WHILE
+enum class CondSrc : uint8_t { BB1=0, BB2=1, LC=2, POS=3 };
+// Condition operator
+enum class CondOp  : uint8_t {
+  BROKEN=0, CLEAR=1,              // BB sensors
+  GT=2, GTE=3, LT=4, LTE=5,      // numeric: >, >=, <, <=
+  EQ=6, NEQ=7                     // numeric: ==, !=
+};
+
+// Parse-time control-flow compile stack (not stored to NVS)
+#define MAX_CTRL_DEPTH   4
+#define MAX_LOOP_NESTING 4
+struct CtrlFrame {
+  enum Type : uint8_t { IF_F=0, ELSE_F=1, FOR_F=2, WHILE_F=3 } ftype;
+  int condJumpIdx;  // IF/WHILE: COND_JUMP idx; FOR: LOOP_INIT idx
+  int skipJumpIdx;  // ELSE: JUMP idx; FOR+WHILE: COND_JUMP idx; -1 otherwise
+  uint8_t depth;    // loop counter depth (FOR only)
+};
 
 // How cycle-profile LC selection works when "start N LC ..." is used
 enum class ProfileMode : uint8_t {
@@ -211,6 +236,31 @@ struct TestStep {
   bool     bbExpected;        // true=expect broken, false=expect clear
   bool     bbWaitMode;        // false=pause-if-wrong, true=wait-until-right
   uint32_t bbTimeoutMs;       // 0=infinite (wait mode only)
+
+  // --- COND_JUMP (type 7) ---
+  // Evaluates a condition; jumps to cfJumpIdx when (result == cfJumpIfTrue).
+  // Used for IF body skip and WHILE/FOR WHILE exit check.
+  uint8_t cfCondSrc;          // CondSrc enum
+  uint8_t cfCondOp;           // CondOp enum
+  float   cfCondVal;          // threshold (LC / POS comparisons)
+  bool    cfJumpIfTrue;       // jump when cond==true (false = jump when NOT met)
+  int16_t cfJumpIdx;          // target step index
+
+  // --- JUMP (type 8) ---
+  // Unconditional jump (ELSE body skip, ENDWHILE back-jump).
+  int16_t jumpIdx;
+
+  // --- LOOP_INIT (type 9) ---
+  uint16_t liTotal;           // max iterations (0 = infinite — used by FOR WHILE with no count)
+  uint8_t  liDepth;           // g_loopCounters[] slot (0-3)
+  int16_t  liEndIdx;          // step to jump to when loop is exhausted
+  bool     liHasCond;         // true when FOR has a WHILE condition
+  // condition fields reused: cfCondSrc, cfCondOp, cfCondVal (set in LOOP_INIT step)
+
+  // --- LOOP_NEXT (type 10) ---
+  uint16_t lnTotal;           // copy of liTotal for infinite-loop check
+  uint8_t  lnDepth;           // g_loopCounters[] slot
+  int16_t  lnBodyIdx;         // step to jump back to (body start or COND_JUMP for FOR WHILE)
 };
 
 /*
@@ -301,6 +351,16 @@ BreakBeamSensor    g_break2(BREAK2_PIN, /*activeLow=*/true, /*pullup=*/false);
 // Test sequence
 TestStep testSequence[MAX_TEST_STEPS];
 int      numSteps = 0;
+
+// ---- Control-flow compile state (parse time only, not saved to NVS) ----
+// These are reset every time the sequence is cleared.
+CtrlFrame g_ctrlStack[MAX_CTRL_DEPTH];
+int       g_ctrlTop    = 0;   // stack pointer; 0 = empty
+int       g_loopDepth  = 0;   // how many FOR loops currently open (for counter slot assignment)
+
+// ---- Runtime FOR-loop counters — reset at the start of every test cycle ----
+// 0xFFFF = "not yet initialized in this cycle"; set to liTotal by LOOP_INIT.
+uint16_t g_loopCounters[MAX_LOOP_NESTING];
 
 // Execution state
 volatile int      currentStepIdx  = 0;
@@ -779,6 +839,9 @@ void serviceAdjSeekForce() {
 // Forward declarations — defined later in the execution section
 int  findStepByLabel(uint8_t label);
 bool handleFailGoto(const TestStep &step);
+bool evalCondition(uint8_t srcU, uint8_t opU, float threshold);
+void resetLoopCounters();
+void resetCtrlStack();
 
 /*
  * lc_inMotionRead — reads the latest LC value from the g_lcLatest cache.
@@ -956,6 +1019,33 @@ void printHelp() {
     "    J<n>      -- on failure jump to step labeled n instead of pausing\n"
     "    Example:  M100 R4 L1 UL500 LL-50 J3   (goto label 3 if limit tripped)\n"
     "              G0 XA N3                     (label 3 is this step)\n"
+    "\nSETUP MODE — control flow (IF / FOR / WHILE):\n"
+    "  Conditions use:  BB1 BROKEN | BB1 CLEAR | BB2 BROKEN | BB2 CLEAR\n"
+    "                   LC > <val> | LC < <val> | LC >= <val> | LC <= <val>\n"
+    "                   POS > <val> | POS < <val> (motor step position)\n"
+    "  IF <condition>        -- execute block only if condition is true\n"
+    "    <steps...>\n"
+    "  ELSE                  -- (optional) execute when IF condition was false\n"
+    "    <steps...>\n"
+    "  ENDIF\n"
+    "  FOR <n>               -- repeat block exactly n times\n"
+    "    <steps...>\n"
+    "  ENDFOR\n"
+    "  FOR <n> WHILE <cond>  -- repeat up to n times while condition stays true\n"
+    "    <steps...>\n"
+    "  ENDFOR\n"
+    "  WHILE <condition>     -- repeat block while condition is true\n"
+    "    <steps...>\n"
+    "  ENDWHILE\n"
+    "  Blocks can be nested up to 4 levels deep.\n"
+    "  Example:\n"
+    "    FOR 5\n"
+    "      G0 XA\n"
+    "      IF BB1 BROKEN\n"
+    "        M200 D90\n"
+    "      ENDIF\n"
+    "      G0 X0\n"
+    "    ENDFOR\n"
     "  upload seq   -- Paste sequence; send END to finish (auto-saves)\n"
     "  clear seq | list seq\n"
     "\nSETUP MODE — settings:\n"
@@ -1138,9 +1228,145 @@ void printSequence() {
         if (s.gotoLabel) Serial.printf("  J=%d", s.gotoLabel);
         Serial.println();
         break;
+      case StepType::COND_JUMP:
+        Serial.printf("[%02d] IF %s  -> goto %d\n", i,
+                      condToStr(s.cfCondSrc, s.cfCondOp, s.cfCondVal).c_str(),
+                      s.cfJumpIdx);
+        break;
+      case StepType::JUMP:
+        Serial.printf("[%02d] JUMP -> %d\n", i, s.jumpIdx);
+        break;
+      case StepType::LOOP_INIT:
+        Serial.printf("[%02d] FOR %d%s  [end->%d]\n", i, s.liTotal,
+                      s.liHasCond ? (" WHILE " + condToStr(s.cfCondSrc,s.cfCondOp,s.cfCondVal)).c_str() : "",
+                      s.liEndIdx);
+        break;
+      case StepType::LOOP_NEXT:
+        Serial.printf("[%02d] ENDFOR  [body->%d]\n", i, s.lnBodyIdx);
+        break;
     }
   }
   unlockSeq();
+}
+
+// ============================================================================
+// CONTROL-FLOW RUNTIME HELPERS
+// ============================================================================
+
+void resetLoopCounters() {
+  for (int i = 0; i < MAX_LOOP_NESTING; i++) g_loopCounters[i] = 0xFFFF;
+}
+
+void resetCtrlStack() {
+  g_ctrlTop   = 0;
+  g_loopDepth = 0;
+}
+
+/*
+ * evalCondition — evaluate a single condition at runtime.
+ *   BB1/BB2: BROKEN (isBroken==true) or CLEAR (isBroken==false)
+ *   LC:      uses most-recent cached LC reading
+ *   POS:     current stepper position
+ */
+bool evalCondition(uint8_t srcU, uint8_t opU, float threshold) {
+  CondSrc src = (CondSrc)srcU;
+  CondOp  op  = (CondOp)opU;
+  float val = 0.f;
+  switch (src) {
+    case CondSrc::BB1: val = g_break1.isBroken() ? 1.f : 0.f; break;
+    case CondSrc::BB2: val = g_break2.isBroken() ? 1.f : 0.f; break;
+    case CondSrc::LC:
+      xSemaphoreTake(lcLatestMux, pdMS_TO_TICKS(5));
+      val = g_lcLatest.value;
+      xSemaphoreGive(lcLatestMux);
+      break;
+    case CondSrc::POS: val = (float)stepper.currentPosition(); break;
+  }
+  switch (op) {
+    case CondOp::BROKEN: return val > 0.5f;
+    case CondOp::CLEAR:  return val < 0.5f;
+    case CondOp::GT:     return val > threshold;
+    case CondOp::GTE:    return val >= threshold;
+    case CondOp::LT:     return val < threshold;
+    case CondOp::LTE:    return val <= threshold;
+    case CondOp::EQ:     return fabsf(val - threshold) < 0.001f;
+    case CondOp::NEQ:    return fabsf(val - threshold) >= 0.001f;
+    default:             return false;
+  }
+}
+
+/*
+ * parseCondition — parse "<source> <op/state> [value]" from an uppercased string.
+ *
+ *   BB1 BROKEN    BB2 CLEAR
+ *   LC > 500      LC <= -10     LC == 0
+ *   POS > 4000    POS < 0
+ *
+ * Returns false and prints an error on invalid syntax.
+ */
+static bool parseCondition(const String &expr, uint8_t &srcOut, uint8_t &opOut, float &valOut) {
+  // Trim leading/trailing spaces
+  String s = expr;
+  s.trim();
+
+  // --- Identify source ---
+  CondSrc src;
+  int srcEnd;
+  if      (s.startsWith("BB1")) { src = CondSrc::BB1; srcEnd = 3; }
+  else if (s.startsWith("BB2")) { src = CondSrc::BB2; srcEnd = 3; }
+  else if (s.startsWith("LC"))  { src = CondSrc::LC;  srcEnd = 2; }
+  else if (s.startsWith("POS")) { src = CondSrc::POS; srcEnd = 3; }
+  else {
+    Serial.println(F("[CF] Unknown condition source. Use BB1, BB2, LC, or POS."));
+    return false;
+  }
+
+  String rest = s.substring(srcEnd);
+  rest.trim();
+
+  // --- BB: BROKEN or CLEAR ---
+  if (src == CondSrc::BB1 || src == CondSrc::BB2) {
+    if (rest.startsWith("BROKEN")) { srcOut = (uint8_t)src; opOut = (uint8_t)CondOp::BROKEN; valOut = 0; return true; }
+    if (rest.startsWith("CLEAR"))  { srcOut = (uint8_t)src; opOut = (uint8_t)CondOp::CLEAR;  valOut = 0; return true; }
+    Serial.println(F("[CF] BB condition must be BROKEN or CLEAR.  Example: BB1 BROKEN"));
+    return false;
+  }
+
+  // --- LC / POS: operator + numeric value ---
+  CondOp op;
+  int    valStart;
+  if      (rest.startsWith(">=")) { op = CondOp::GTE; valStart = 2; }
+  else if (rest.startsWith("<=")) { op = CondOp::LTE; valStart = 2; }
+  else if (rest.startsWith("!=")) { op = CondOp::NEQ; valStart = 2; }
+  else if (rest.startsWith("==")) { op = CondOp::EQ;  valStart = 2; }
+  else if (rest.startsWith(">"))  { op = CondOp::GT;  valStart = 1; }
+  else if (rest.startsWith("<"))  { op = CondOp::LT;  valStart = 1; }
+  else {
+    Serial.println(F("[CF] Expected operator: >, <, >=, <=, ==, !=  Example: LC > 500"));
+    return false;
+  }
+  String valStr = rest.substring(valStart);
+  valStr.trim();
+  if (valStr.length() == 0) {
+    Serial.println(F("[CF] Missing numeric value after operator."));
+    return false;
+  }
+  srcOut = (uint8_t)src;
+  opOut  = (uint8_t)op;
+  valOut = valStr.toFloat();
+  return true;
+}
+
+// Human-readable condition string for printSequence
+static String condToStr(uint8_t srcU, uint8_t opU, float val) {
+  const char *srcs[] = { "BB1", "BB2", "LC", "POS" };
+  const char *ops[]  = { "BROKEN", "CLEAR", ">", ">=", "<", "<=", "==", "!=" };
+  if (srcU > 3 || opU > 7) return "?";
+  String s = String(srcs[srcU]);
+  s += ' ';
+  s += ops[opU];
+  if (opU >= 2) { s += ' '; s += String(val, 3); }
+  return s;
 }
 
 // ============================================================================
@@ -1480,6 +1706,205 @@ void parseGCode(const String &rawLine) {
     return;
   }
 
+  // ============================================================
+  // CONTROL FLOW — IF / ELSE / ENDIF / FOR / ENDFOR / WHILE / ENDWHILE
+  // ============================================================
+
+  // ---- IF <condition> ----
+  // Emits COND_JUMP that skips the IF body when condition is NOT met.
+  if (line.startsWith("IF ")) {
+    if (g_ctrlTop >= MAX_CTRL_DEPTH) {
+      Serial.println(F("[CF] ERROR: nesting too deep (max 4 levels).")); return;
+    }
+    String expr = line.substring(3);
+    uint8_t src, op; float val;
+    if (!parseCondition(expr, src, op, val)) return;
+
+    TestStep s = {};
+    s.type        = StepType::COND_JUMP;
+    s.cfCondSrc   = src;  s.cfCondOp = op;  s.cfCondVal = val;
+    s.cfJumpIfTrue = false;   // jump (skip body) when condition is FALSE
+    s.cfJumpIdx   = 0;        // patched at ELSE or ENDIF
+    g_ctrlStack[g_ctrlTop] = { CtrlFrame::IF_F, numSteps, -1, 0 };
+    g_ctrlTop++;
+    lockSeq(); testSequence[numSteps++] = s; unlockSeq();
+    Serial.printf("[SEQ] Step %d: IF %s\n", numSteps-1, condToStr(src,op,val).c_str());
+    return;
+  }
+
+  // ---- ELSE ----
+  if (line == "ELSE") {
+    if (g_ctrlTop == 0 || g_ctrlStack[g_ctrlTop-1].ftype != CtrlFrame::IF_F) {
+      Serial.println(F("[CF] ERROR: ELSE without matching IF.")); return;
+    }
+    // Emit unconditional JUMP to skip the ELSE body (target patched at ENDIF)
+    TestStep s = {}; s.type = StepType::JUMP; s.jumpIdx = 0;
+    int jumpIdx = numSteps;
+    lockSeq(); testSequence[numSteps++] = s; unlockSeq();
+
+    // Patch the IF's COND_JUMP to point to first step of ELSE body (= after the JUMP)
+    lockSeq(); testSequence[g_ctrlStack[g_ctrlTop-1].condJumpIdx].cfJumpIdx = numSteps; unlockSeq();
+
+    // Update stack: switch to ELSE frame, record JUMP index to patch later
+    g_ctrlStack[g_ctrlTop-1].ftype       = CtrlFrame::ELSE_F;
+    g_ctrlStack[g_ctrlTop-1].skipJumpIdx = jumpIdx;
+    Serial.printf("[SEQ] Step %d: ELSE (JUMP, target TBD)\n", numSteps-1);
+    return;
+  }
+
+  // ---- ENDIF ----
+  if (line == "ENDIF") {
+    if (g_ctrlTop == 0 ||
+        (g_ctrlStack[g_ctrlTop-1].ftype != CtrlFrame::IF_F &&
+         g_ctrlStack[g_ctrlTop-1].ftype != CtrlFrame::ELSE_F)) {
+      Serial.println(F("[CF] ERROR: ENDIF without matching IF.")); return;
+    }
+    g_ctrlTop--;
+    if (g_ctrlStack[g_ctrlTop].ftype == CtrlFrame::ELSE_F) {
+      // Patch the JUMP (skip-else) to here
+      lockSeq(); testSequence[g_ctrlStack[g_ctrlTop].skipJumpIdx].jumpIdx = numSteps; unlockSeq();
+      // COND_JUMP was already patched at ELSE
+    } else {
+      // IF without ELSE: patch COND_JUMP to here
+      lockSeq(); testSequence[g_ctrlStack[g_ctrlTop].condJumpIdx].cfJumpIdx = numSteps; unlockSeq();
+    }
+    Serial.printf("[CF] ENDIF at step %d\n", numSteps);
+    return;
+  }
+
+  // ---- FOR <n> [WHILE <condition>] ----
+  // FOR 5            → repeat body exactly 5 times
+  // FOR 10 WHILE BB1 BROKEN  → up to 10 times while BB1 is broken
+  if (line.startsWith("FOR ")) {
+    if (g_ctrlTop >= MAX_CTRL_DEPTH || g_loopDepth >= MAX_LOOP_NESTING) {
+      Serial.println(F("[CF] ERROR: nesting too deep (max 4 FOR/WHILE levels).")); return;
+    }
+    String args = line.substring(4); args.trim();
+    // Extract leading count
+    uint16_t total = (uint16_t)args.toInt();
+    if (total == 0) {
+      Serial.println(F("[CF] ERROR: FOR needs a count > 0.  Example: FOR 5")); return;
+    }
+
+    // Check for optional WHILE condition
+    int whilePos = args.indexOf(" WHILE ");
+    bool hasCond = (whilePos >= 0);
+    uint8_t cSrc=0, cOp=0; float cVal=0;
+    if (hasCond) {
+      String expr = args.substring(whilePos + 7);
+      if (!parseCondition(expr, cSrc, cOp, cVal)) return;
+    }
+
+    // Emit LOOP_INIT
+    TestStep li = {};
+    li.type      = StepType::LOOP_INIT;
+    li.liTotal   = total;
+    li.liDepth   = (uint8_t)g_loopDepth;
+    li.liEndIdx  = 0;        // patched at ENDFOR
+    li.liHasCond = hasCond;
+    li.cfCondSrc = cSrc; li.cfCondOp = cOp; li.cfCondVal = cVal;
+    int loopInitIdx = numSteps;
+    lockSeq(); testSequence[numSteps++] = li; unlockSeq();
+
+    // If WHILE condition, emit COND_JUMP right after LOOP_INIT
+    int condJumpIdx2 = -1;
+    if (hasCond) {
+      TestStep cj = {};
+      cj.type        = StepType::COND_JUMP;
+      cj.cfCondSrc   = cSrc; cj.cfCondOp = cOp; cj.cfCondVal = cVal;
+      cj.cfJumpIfTrue = false;   // exit loop when condition NOT met
+      cj.cfJumpIdx   = 0;        // patched at ENDFOR
+      condJumpIdx2   = numSteps;
+      lockSeq(); testSequence[numSteps++] = cj; unlockSeq();
+      Serial.printf("[SEQ] Steps %d-%d: FOR %d WHILE %s\n",
+                    numSteps-2, numSteps-1, total, condToStr(cSrc,cOp,cVal).c_str());
+    } else {
+      Serial.printf("[SEQ] Step %d: FOR %d\n", numSteps-1, total);
+    }
+
+    g_ctrlStack[g_ctrlTop] = { CtrlFrame::FOR_F, loopInitIdx, condJumpIdx2, (uint8_t)g_loopDepth };
+    g_ctrlTop++;
+    g_loopDepth++;
+    return;
+  }
+
+  // ---- ENDFOR ----
+  if (line == "ENDFOR") {
+    if (g_ctrlTop == 0 || g_ctrlStack[g_ctrlTop-1].ftype != CtrlFrame::FOR_F) {
+      Serial.println(F("[CF] ERROR: ENDFOR without matching FOR.")); return;
+    }
+    g_ctrlTop--;
+    g_loopDepth--;
+    int      loopInitIdx  = g_ctrlStack[g_ctrlTop].condJumpIdx;
+    int      condJumpIdx2 = g_ctrlStack[g_ctrlTop].skipJumpIdx;  // -1 if no WHILE
+    uint8_t  depth        = g_ctrlStack[g_ctrlTop].depth;
+    uint16_t total        = testSequence[loopInitIdx].liTotal;
+
+    // Body starts right after LOOP_INIT (skip the optional COND_JUMP on first pass,
+    // but LOOP_NEXT must jump back to the COND_JUMP so condition is rechecked).
+    int bodyStart = (condJumpIdx2 >= 0) ? condJumpIdx2 : loopInitIdx + 1;
+
+    // Emit LOOP_NEXT
+    TestStep ln = {};
+    ln.type      = StepType::LOOP_NEXT;
+    ln.lnTotal   = total;
+    ln.lnDepth   = depth;
+    ln.lnBodyIdx = bodyStart;
+    lockSeq(); testSequence[numSteps++] = ln; unlockSeq();
+
+    // Patch LOOP_INIT.liEndIdx = first step after loop
+    lockSeq(); testSequence[loopInitIdx].liEndIdx = numSteps; unlockSeq();
+
+    // Patch FOR WHILE's COND_JUMP exit target
+    if (condJumpIdx2 >= 0) {
+      lockSeq(); testSequence[condJumpIdx2].cfJumpIdx = numSteps; unlockSeq();
+    }
+    Serial.printf("[CF] ENDFOR: LOOP_NEXT at %d  bodyStart=%d  end=%d\n",
+                  numSteps-1, bodyStart, numSteps);
+    return;
+  }
+
+  // ---- WHILE <condition> ----
+  // Standalone WHILE (no count limit).  Compiles to COND_JUMP + body + JUMP(back).
+  if (line.startsWith("WHILE ")) {
+    if (g_ctrlTop >= MAX_CTRL_DEPTH) {
+      Serial.println(F("[CF] ERROR: nesting too deep (max 4 levels).")); return;
+    }
+    String expr = line.substring(6);
+    uint8_t src, op; float val;
+    if (!parseCondition(expr, src, op, val)) return;
+
+    TestStep s = {};
+    s.type        = StepType::COND_JUMP;
+    s.cfCondSrc   = src;  s.cfCondOp = op;  s.cfCondVal = val;
+    s.cfJumpIfTrue = false;   // exit loop when condition NOT met
+    s.cfJumpIdx   = 0;        // patched at ENDWHILE
+    g_ctrlStack[g_ctrlTop] = { CtrlFrame::WHILE_F, numSteps, -1, 0 };
+    g_ctrlTop++;
+    lockSeq(); testSequence[numSteps++] = s; unlockSeq();
+    Serial.printf("[SEQ] Step %d: WHILE %s\n", numSteps-1, condToStr(src,op,val).c_str());
+    return;
+  }
+
+  // ---- ENDWHILE ----
+  if (line == "ENDWHILE") {
+    if (g_ctrlTop == 0 || g_ctrlStack[g_ctrlTop-1].ftype != CtrlFrame::WHILE_F) {
+      Serial.println(F("[CF] ERROR: ENDWHILE without matching WHILE.")); return;
+    }
+    g_ctrlTop--;
+    int condJumpAtTop = g_ctrlStack[g_ctrlTop].condJumpIdx;
+
+    // Emit JUMP back to COND_JUMP (re-evaluate condition each iteration)
+    TestStep s = {}; s.type = StepType::JUMP; s.jumpIdx = condJumpAtTop;
+    lockSeq(); testSequence[numSteps++] = s; unlockSeq();
+
+    // Patch COND_JUMP's exit target to here (first step after loop)
+    lockSeq(); testSequence[condJumpAtTop].cfJumpIdx = numSteps; unlockSeq();
+    Serial.printf("[CF] ENDWHILE: JUMP at %d back to %d  exit=%d\n",
+                  numSteps-1, condJumpAtTop, numSteps);
+    return;
+  }
+
   Serial.printf("[G-code] Unknown: %s\n", line.c_str());
 }
 
@@ -1740,12 +2165,14 @@ void handleCommand(const String &rawLine) {
 
     if (sl == "upload seq") {
       lockSeq(); numSteps = 0; currentStepIdx = 0; unlockSeq();
+      resetCtrlStack();
       inUploadMode = true;
       Serial.println(F("[UPLOAD] Ready. Paste G-code lines, then send 'END'."));
       return;
     }
     if (sl == "clear seq") {
       lockSeq(); numSteps = 0; currentStepIdx = 0; unlockSeq();
+      resetCtrlStack();
       Serial.println(F("Sequence cleared."));
       return;
     }
@@ -1995,6 +2422,12 @@ void handleCommand(const String &rawLine) {
         }
       }
 
+      // Warn if sequence has unclosed IF/FOR/WHILE blocks
+      if (g_ctrlTop > 0) {
+        Serial.printf("[TEST] WARNING: sequence has %d unclosed IF/FOR/WHILE block(s)!\n", g_ctrlTop);
+        Serial.println(F("[TEST]   Add matching ENDIF/ENDFOR/ENDWHILE before starting."));
+      }
+      resetLoopCounters();
       cyclesGoal      = n;
       cyclesDone      = 0;
       currentStepIdx  = 0;
@@ -2137,6 +2570,7 @@ void tickTestExecution() {
       return;
     }
     currentStepIdx = 0; stepInitialized = false;
+    resetLoopCounters();   // reset FOR counters for next cycle
     return;
   }
 
@@ -2284,6 +2718,56 @@ void tickTestExecution() {
           Serial.printf("  timeout=%lums", (unsigned long)step.bbTimeoutMs);
         Serial.println();
         return;
+
+      case StepType::COND_JUMP: {
+        bool cond = evalCondition(step.cfCondSrc, step.cfCondOp, step.cfCondVal);
+        bool doJump = (cond == step.cfJumpIfTrue);
+        if (doJump) {
+          currentStepIdx  = step.cfJumpIdx;
+        } else {
+          currentStepIdx++;
+        }
+        stepInitialized = false;
+        return;
+      }
+
+      case StepType::JUMP:
+        currentStepIdx  = step.jumpIdx;
+        stepInitialized = false;
+        return;
+
+      case StepType::LOOP_INIT: {
+        // First visit in this cycle: initialise the counter
+        if (g_loopCounters[step.liDepth] == 0xFFFF) {
+          g_loopCounters[step.liDepth] = step.liTotal;
+        }
+        // Check if count is exhausted (handles edge case of total==0 with liHasCond only)
+        if (step.liTotal > 0 && g_loopCounters[step.liDepth] == 0) {
+          g_loopCounters[step.liDepth] = 0xFFFF;  // reset for next cycle
+          currentStepIdx = step.liEndIdx;
+        } else {
+          currentStepIdx++;  // fall through into loop body
+        }
+        stepInitialized = false;
+        return;
+      }
+
+      case StepType::LOOP_NEXT: {
+        if (step.lnTotal == 0) {
+          // Infinite loop (shouldn't reach here normally; COND_JUMP exits)
+          currentStepIdx = step.lnBodyIdx;
+        } else {
+          g_loopCounters[step.lnDepth]--;
+          if (g_loopCounters[step.lnDepth] > 0) {
+            currentStepIdx = step.lnBodyIdx;   // more iterations remain
+          } else {
+            g_loopCounters[step.lnDepth] = 0xFFFF;  // reset for next cycle
+            currentStepIdx++;                        // loop done, continue
+          }
+        }
+        stepInitialized = false;
+        return;
+      }
     }
   }
 
@@ -2416,7 +2900,11 @@ void tickTestExecution() {
     }
 
     case StepType::SERVO_MOVE:
-      break;  // handled entirely in init; should not be reached
+    case StepType::COND_JUMP:
+    case StepType::JUMP:
+    case StepType::LOOP_INIT:
+    case StepType::LOOP_NEXT:
+      break;  // handled entirely in init; should not be reached in progress
   }
 }
 
