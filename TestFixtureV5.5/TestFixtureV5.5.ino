@@ -108,7 +108,7 @@ static const uint8_t  SERVO_LEDC_CHANNEL  = 0;   // used only on Arduino-ESP32 v
 
 #define NVS_MAGIC        0xC0BEEF02u
 #define NVS_VERSION      5u          // bumped: added servo + break-beam config fields
-#define SEQ_MAGIC        0x5E900004u // bumped: TestStep struct changed (SEEK_FORCE)
+#define SEQ_MAGIC        0x5E900005u // bumped: added SERVO_MOVE, WAIT_BB, labels
 
 #define LC_RING_CAP      512
 #define SEQ_NVS_KEY_HDR  "seq_hdr"
@@ -120,7 +120,8 @@ static const uint8_t  SERVO_LEDC_CHANNEL  = 0;   // used only on Arduino-ESP32 v
 
 enum class Mode     : uint8_t { SETUP=0, ADJUSTMENTS=1, LIVE_TEST=2 };
 enum class RunState : uint8_t { IDLE=0, RUNNING=1, PAUSED=2, COMPLETE=3 };
-enum class StepType : uint8_t { MOVE=0, DWELL=1, READ_LC=2, SEEK_FORCE=3, PAUSE=4 };
+enum class StepType : uint8_t { MOVE=0, DWELL=1, READ_LC=2, SEEK_FORCE=3, PAUSE=4,
+                               SERVO_MOVE=5, WAIT_BB=6 };
 
 // How cycle-profile LC selection works when "start N LC ..." is used
 enum class ProfileMode : uint8_t {
@@ -149,6 +150,13 @@ enum class ProfileMode : uint8_t {
 struct TestStep {
   StepType type;
 
+  // Step label (1-255 = named label, 0 = unlabeled).
+  // Set with N<n> on any G-code line; referenced by J<n> on limit/beam-fail steps.
+  uint8_t stepLabel;
+  // On limit/beam failure: jump to step with stepLabel==gotoLabel instead of pausing.
+  // 0 = no jump (default: pause on failure).
+  uint8_t gotoLabel;
+
   // --- MOVE ---
   bool    useNamedPos;
   uint8_t posVarIdx;          // 0=XA, 1=XB, 2=XC, 3=XD
@@ -166,14 +174,20 @@ struct TestStep {
   float lcStepUpperLimit;
   float lcStepLowerLimit;
 
+  // Concurrent servo (MOVE only): fire servo move at start of motor move
+  bool    servoWithMove;
+  bool    servoMoveUseNamed;  // true = named pos (SA..SD), false = degree value
+  uint8_t servoMoveVarIdx;    // 0=SA..3=SD (when servoMoveUseNamed)
+  float   servoMoveDeg;       // degrees (when !servoMoveUseNamed)
+
   // --- DWELL ---
   uint32_t dwellMs;
 
   // --- READ_LC (stationary) ---
   uint8_t lcReadings;
   bool    checkLimits;
-  float   readStepUpperLimit;  // add this for M100 too
-  float   readStepLowerLimit;  // add this for M100 too
+  float   readStepUpperLimit;
+  float   readStepLowerLimit;
 
   // --- SEEK_FORCE (M101) — PI+D on force, velocity via runSpeed() ---
   float    sfTarget;
@@ -186,6 +200,17 @@ struct TestStep {
   uint32_t sfSettleMs;
   int8_t   sfDir;
   long     sfMaxTravel;  // 0 = no limit (|pos - start|)
+
+  // --- SERVO_MOVE (M200) ---
+  bool    servoUseNamed;      // true = named pos (SA..SD), false = degree value
+  uint8_t servoVarIdx;        // 0=SA..3=SD (when servoUseNamed)
+  float   servoDeg;           // degrees (when !servoUseNamed)
+
+  // --- WAIT_BB (M202) ---
+  uint8_t  bbSensor;          // 1 or 2
+  bool     bbExpected;        // true=expect broken, false=expect clear
+  bool     bbWaitMode;        // false=pause-if-wrong, true=wait-until-right
+  uint32_t bbTimeoutMs;       // 0=infinite (wait mode only)
 };
 
 /*
@@ -751,6 +776,10 @@ void serviceAdjSeekForce() {
   }
 }
 
+// Forward declarations — defined later in the execution section
+int  findStepByLabel(uint8_t label);
+bool handleFailGoto(const TestStep &step);
+
 /*
  * lc_inMotionRead — reads the latest LC value from the g_lcLatest cache.
  * Non-blocking: taskLcSample owns the HX711 conversion; this function
@@ -801,14 +830,13 @@ bool lc_inMotionRead(const TestStep &step, long pos, bool doLog) {
   if (cfg.lc_limitsOn) {
     float upper = step.lcCheckLimits ? step.lcStepUpperLimit : cfg.lc_upperLimit;
     float lower = step.lcCheckLimits ? step.lcStepLowerLimit : cfg.lc_lowerLimit;
-    //Serial.printf("[DBG] limitsOn=%d lcCheckLimits=%d val=%.4f upper=%.4f lower=%.4f\n", cfg.lc_limitsOn, step.lcCheckLimits, val, upper, lower);
     bool outside = (val > upper || val < lower);
     if (outside) {
-      Serial.printf("[TEST] LC LIMIT EXCEEDED cyc=%d pos=%ld val=%.4f — Pausing.\n",
-                    cyclesDone + 1, pos, val);
-      runState    = RunState::PAUSED;
+      Serial.printf("[TEST] LC LIMIT EXCEEDED cyc=%d pos=%ld val=%.4f (range [%.3f,%.3f])\n",
+                    cyclesDone + 1, pos, val, lower, upper);
       lcLimitTrip = true;
-      stepper.stop();
+      stepper.stop();        // always stop motor on limit trip
+      handleFailGoto(step);  // then either jump to label or pause
       return false;
     }
   }
@@ -907,11 +935,27 @@ void printHelp() {
     "    RT<ms>    -- rate-based: read every <ms> during move\n"
     "    P<s,...>  -- position-based: read when pos passes each step value\n"
     "    L1        -- pause test if reading exceeds limits\n"
+    "    SN<A-D>   -- also move servo to named position at start of move\n"
+    "    SV<deg>   -- also move servo to degree value (0-180) at start of move\n"
     "  G4 P<ms>                  -- Dwell\n"
     "  G4 P                      -- Pause sequence; 'resume' continues next step\n"
-    "  M100 [R<n>] [L<0|1>]     -- Stationary LC read (motor stopped)\n"
+    "  M100 [R<n>] [L<0|1>] [UL<upper>] [LL<lower>]  -- Stationary LC read\n"
     "  M101 F<f> [V<sps> C<creep> E<eps> T<ms> P<Kp> I<Ki> D<Kd> S<±1> X<max_steps>]\n"
     "                            -- Seek target force (PI+D velocity loop)\n"
+    "  M200 D<deg>               -- Servo move to degrees (0-180) as a sequence step\n"
+    "  M200 S<A-D>               -- Servo move to named position SA..SD as a step\n"
+    "  M202 B<1|2> E<0|1> [W<0|1>] [T<ms>]  -- Break-beam check/wait step\n"
+    "    B<1|2>    -- which sensor (default 1)\n"
+    "    E0        -- expect beam CLEAR (not broken)\n"
+    "    E1        -- expect beam BROKEN\n"
+    "    W0        -- check mode: pause if state wrong (default)\n"
+    "    W1        -- wait mode: block until state matches (or timeout)\n"
+    "    T<ms>     -- timeout for wait mode; 0=infinite (default)\n"
+    "  Step labels & conditional goto (any step type):\n"
+    "    N<n>      -- attach label n (1-255) to this step\n"
+    "    J<n>      -- on failure jump to step labeled n instead of pausing\n"
+    "    Example:  M100 R4 L1 UL500 LL-50 J3   (goto label 3 if limit tripped)\n"
+    "              G0 XA N3                     (label 3 is this step)\n"
     "  upload seq   -- Paste sequence; send END to finish (auto-saves)\n"
     "  clear seq | list seq\n"
     "\nSETUP MODE — settings:\n"
@@ -1031,12 +1075,15 @@ void printSequence() {
   Serial.printf("[SEQ] %d step(s):\n", numSteps);
   for (int i = 0; i < numSteps; i++) {
     const TestStep &s = testSequence[i];
+    // Print label prefix if set
+    if (s.stepLabel) Serial.printf("  #%d", s.stepLabel);
+    else             Serial.print("  ");
     switch (s.type) {
       case StepType::MOVE: {
         char xbuf[12];
         if (s.useNamedPos) snprintf(xbuf, sizeof(xbuf), "X%c", 'A'+s.posVarIdx);
         else               snprintf(xbuf, sizeof(xbuf), "%ld", s.targetSteps);
-        Serial.printf("  [%02d] MOVE %s  F%.0f  A%.0f", i, xbuf, s.speed, s.accel);
+        Serial.printf("[%02d] MOVE %s  F%.0f  A%.0f", i, xbuf, s.speed, s.accel);
         if (s.lcInMotion) {
           Serial.printf("  LC R=%d", s.lcSamples ? s.lcSamples : cfg.lc_inMotionSamples);
           if (s.lcRateMs)   Serial.printf(" RT=%lu", (unsigned long)s.lcRateMs);
@@ -1049,24 +1096,47 @@ void printSequence() {
           }
           if (s.lcCheckLimits) Serial.print(" L1");
         }
+        if (s.servoWithMove) {
+          if (s.servoMoveUseNamed) Serial.printf("  SN=%c", 'A'+s.servoMoveVarIdx);
+          else                     Serial.printf("  SV=%.1f", s.servoMoveDeg);
+        }
+        if (s.gotoLabel) Serial.printf("  J=%d", s.gotoLabel);
         Serial.println();
         break;
       }
       case StepType::DWELL:
-        Serial.printf("  [%02d] DWELL %lu ms\n", i, (unsigned long)s.dwellMs);
+        Serial.printf("[%02d] DWELL %lu ms\n", i, (unsigned long)s.dwellMs);
         break;
       case StepType::PAUSE:
-        Serial.printf("  [%02d] PAUSE (wait for 'resume')\n", i);
+        Serial.printf("[%02d] PAUSE (wait for 'resume')\n", i);
         LINK_UART.printf("S paused\n");
         break;
       case StepType::READ_LC:
-        Serial.printf("  [%02d] READ_LC  R=%d  limits=%s\n",
-                      i, s.lcReadings, s.checkLimits ? "ON" : "off");
+        Serial.printf("[%02d] READ_LC  R=%d  limits=%s", i, s.lcReadings,
+                      s.checkLimits ? "ON" : "off");
+        if (s.checkLimits)
+          Serial.printf("  UL=%.3f  LL=%.3f", s.readStepUpperLimit, s.readStepLowerLimit);
+        if (s.gotoLabel) Serial.printf("  J=%d", s.gotoLabel);
+        Serial.println();
         break;
       case StepType::SEEK_FORCE:
-        Serial.printf("  [%02d] SEEK_FORCE F=%.4f V=%.0f C=%.0f E=%.4f T=%lu P=%.2f I=%.2f D=%.3f S=%d X=%ld\n",
+        Serial.printf("[%02d] SEEK_FORCE F=%.4f V=%.0f C=%.0f E=%.4f T=%lu P=%.2f I=%.2f D=%.3f S=%d X=%ld\n",
                       i, s.sfTarget, s.sfMaxSps, s.sfCreepSps, s.sfEpsilon,
                       (unsigned long)s.sfSettleMs, s.sfKp, s.sfKi, s.sfKd, (int)s.sfDir, (long)s.sfMaxTravel);
+        break;
+      case StepType::SERVO_MOVE:
+        if (s.servoUseNamed) Serial.printf("[%02d] SERVO_MOVE S%c\n", i, 'A'+s.servoVarIdx);
+        else                 Serial.printf("[%02d] SERVO_MOVE %.1f deg\n", i, s.servoDeg);
+        break;
+      case StepType::WAIT_BB:
+        Serial.printf("[%02d] WAIT_BB  sensor=%d  expect=%s  mode=%s", i,
+                      s.bbSensor,
+                      s.bbExpected ? "broken" : "clear",
+                      s.bbWaitMode ? "wait" : "check");
+        if (s.bbWaitMode && s.bbTimeoutMs)
+          Serial.printf("  T=%lums", (unsigned long)s.bbTimeoutMs);
+        if (s.gotoLabel) Serial.printf("  J=%d", s.gotoLabel);
+        Serial.println();
         break;
     }
   }
@@ -1188,6 +1258,31 @@ void parseGCode(const String &rawLine) {
       }
     }
 
+    // Concurrent servo: SN<A..D> = named pos, SV<deg> = degree value
+    {
+      int snIdx = line.indexOf("SN");
+      if (snIdx >= 0) {
+        int svar = servoNamedIdx(line.charAt(snIdx + 2));
+        if (svar >= 0) {
+          step.servoWithMove      = true;
+          step.servoMoveUseNamed  = true;
+          step.servoMoveVarIdx    = (uint8_t)svar;
+        }
+      }
+      if (!step.servoWithMove) {
+        float svDeg = get2Param("SV", -1.0f);
+        if (svDeg >= 0.f && svDeg <= 180.f) {
+          step.servoWithMove     = true;
+          step.servoMoveUseNamed = false;
+          step.servoMoveDeg      = svDeg;
+        }
+      }
+    }
+
+    // Step label (N) and goto-on-fail label (J) — shared by all step types
+    step.stepLabel = (uint8_t)getParam('N', 0.f);
+    step.gotoLabel = (uint8_t)getParam('J', 0.f);
+
     lockSeq();
     testSequence[numSteps++] = step;
     unlockSeq();
@@ -1203,6 +1298,12 @@ void parseGCode(const String &rawLine) {
       if (step.lcPosCount) { Serial.printf(" P[%d]", step.lcPosCount); }
       if (step.lcCheckLimits) Serial.print(" L1");
     }
+    if (step.servoWithMove) {
+      if (step.servoMoveUseNamed) Serial.printf("  SN=%c", 'A'+step.servoMoveVarIdx);
+      else                        Serial.printf("  SV=%.1f", step.servoMoveDeg);
+    }
+    if (step.stepLabel) Serial.printf("  N=%d", step.stepLabel);
+    if (step.gotoLabel) Serial.printf("  J=%d", step.gotoLabel);
     Serial.println();
     return;
   }
@@ -1222,32 +1323,52 @@ void parseGCode(const String &rawLine) {
       }
     }
     if (pIdx >= 0 && !hasNumericP) {
-      step.type = StepType::PAUSE;
+      step.type      = StepType::PAUSE;
+      step.stepLabel = (uint8_t)getParam('N', 0.f);
+      step.gotoLabel = (uint8_t)getParam('J', 0.f);
       lockSeq();
       testSequence[numSteps++] = step;
       unlockSeq();
-      Serial.printf("[SEQ] Step %d: PAUSE (wait for 'resume')\n", numSteps-1);
+      Serial.printf("[SEQ] Step %d: PAUSE (wait for 'resume')", numSteps-1);
+      if (step.stepLabel) Serial.printf("  N=%d", step.stepLabel);
+      Serial.println();
       return;
     }
-    step.type    = StepType::DWELL;
-    step.dwellMs = (uint32_t)getParam('P', 1000.0f);
+    step.type      = StepType::DWELL;
+    step.dwellMs   = (uint32_t)getParam('P', 1000.0f);
+    step.stepLabel = (uint8_t)getParam('N', 0.f);
+    step.gotoLabel = (uint8_t)getParam('J', 0.f);
     lockSeq();
     testSequence[numSteps++] = step;
     unlockSeq();
-    Serial.printf("[SEQ] Step %d: DWELL %lu ms\n", numSteps-1, (unsigned long)step.dwellMs);
+    Serial.printf("[SEQ] Step %d: DWELL %lu ms", numSteps-1, (unsigned long)step.dwellMs);
+    if (step.stepLabel) Serial.printf("  N=%d", step.stepLabel);
+    Serial.println();
     return;
   }
 
   // ---- M100 : Stationary LC read ----
+  // M100 [R<n>] [L<0|1>] [UL<upper>] [LL<lower>] [N<label>] [J<goto_label>]
   if (line.startsWith("M100")) {
     step.type        = StepType::READ_LC;
     step.lcReadings  = max((uint8_t)1, (uint8_t)getParam('R', 5.0f));
     step.checkLimits = ((int)getParam('L', 0.0f)) != 0;
+    lockCfg();
+    step.readStepUpperLimit = get2Param("UL", cfg.lc_upperLimit);
+    step.readStepLowerLimit = get2Param("LL", cfg.lc_lowerLimit);
+    unlockCfg();
+    step.stepLabel = (uint8_t)getParam('N', 0.f);
+    step.gotoLabel = (uint8_t)getParam('J', 0.f);
     lockSeq();
     testSequence[numSteps++] = step;
     unlockSeq();
-    Serial.printf("[SEQ] Step %d: READ_LC  R=%d  limits=%s\n",
-                  numSteps-1, step.lcReadings, step.checkLimits ? "ON" : "off");
+    Serial.printf("[SEQ] Step %d: READ_LC  R=%d  limits=%s", numSteps-1,
+                  step.lcReadings, step.checkLimits ? "ON" : "off");
+    if (step.checkLimits)
+      Serial.printf("  UL=%.3f  LL=%.3f", step.readStepUpperLimit, step.readStepLowerLimit);
+    if (step.stepLabel) Serial.printf("  N=%d", step.stepLabel);
+    if (step.gotoLabel) Serial.printf("  J=%d", step.gotoLabel);
+    Serial.println();
     return;
   }
 
@@ -1277,6 +1398,8 @@ void parseGCode(const String &rawLine) {
     int sgn          = (int)gp('S', (float)cfg.seek_dir);
     step.sfDir       = (int8_t)(sgn >= 0 ? 1 : -1);
     step.sfMaxTravel = (long)gp('X', 0.f);
+    step.stepLabel   = (uint8_t)gp('N', 0.f);
+    step.gotoLabel   = (uint8_t)gp('J', 0.f);
     unlockCfg();
     if (step.sfCreepSps < 1.f) step.sfCreepSps = 1.f;
     if (step.sfMaxSps < step.sfCreepSps) step.sfMaxSps = step.sfCreepSps;
@@ -1287,6 +1410,73 @@ void parseGCode(const String &rawLine) {
                   numSteps - 1, step.sfTarget, step.sfMaxSps, step.sfCreepSps, step.sfEpsilon,
                   (unsigned long)step.sfSettleMs, step.sfKp, step.sfKi, step.sfKd, (int)step.sfDir,
                   (long)step.sfMaxTravel);
+    return;
+  }
+
+  // ---- M200 : Servo move (sequence step) ----
+  // M200 S<A..D>         -- move to named servo position
+  // M200 D<deg>          -- move to degree value (0..180)
+  // Optional: N<label>  J<goto_label>  (labels have no effect on SERVO_MOVE failures)
+  if (line.startsWith("M200")) {
+    step.type = StepType::SERVO_MOVE;
+
+    // Check for named servo position: S<A..D>
+    int sIdx = line.indexOf(" S");
+    if (sIdx >= 0) {
+      int svar = servoNamedIdx(line.charAt(sIdx + 2));
+      if (svar >= 0) {
+        step.servoUseNamed = true;
+        step.servoVarIdx   = (uint8_t)svar;
+      }
+    }
+    if (!step.servoUseNamed) {
+      step.servoDeg = getParam('D', -1.0f);
+      if (step.servoDeg < 0.f || step.servoDeg > 180.f) {
+        Serial.println(F("[M200] Provide S<A-D> or D<deg 0-180>. Example: M200 D45  or  M200 SA"));
+        return;
+      }
+    }
+    step.stepLabel = (uint8_t)getParam('N', 0.f);
+    step.gotoLabel = (uint8_t)getParam('J', 0.f);
+    lockSeq();
+    testSequence[numSteps++] = step;
+    unlockSeq();
+    if (step.servoUseNamed)
+      Serial.printf("[SEQ] Step %d: SERVO_MOVE S%c", numSteps-1, 'A'+step.servoVarIdx);
+    else
+      Serial.printf("[SEQ] Step %d: SERVO_MOVE %.1f deg", numSteps-1, step.servoDeg);
+    if (step.stepLabel) Serial.printf("  N=%d", step.stepLabel);
+    Serial.println();
+    return;
+  }
+
+  // ---- M202 : Wait / check break-beam ----
+  // M202 B<1|2> E<0|1> [W<0|1>] [T<ms>] [N<label>] [J<goto_label>]
+  //   B = sensor number (1 or 2, default 1)
+  //   E = expected state: 0=clear (beam intact), 1=broken
+  //   W = mode: 0=pause-if-wrong (default), 1=wait-until-right
+  //   T = timeout ms in wait mode (0=infinite)
+  //   J = on failure (wrong state or timeout) jump to step labeled J instead of pausing
+  if (line.startsWith("M202")) {
+    step.type         = StepType::WAIT_BB;
+    step.bbSensor     = (uint8_t)constrain((int)getParam('B', 1.f), 1, 2);
+    step.bbExpected   = ((int)getParam('E', 0.f)) != 0;
+    step.bbWaitMode   = ((int)getParam('W', 0.f)) != 0;
+    step.bbTimeoutMs  = (uint32_t)getParam('T', 0.f);
+    step.stepLabel    = (uint8_t)getParam('N', 0.f);
+    step.gotoLabel    = (uint8_t)getParam('J', 0.f);
+    lockSeq();
+    testSequence[numSteps++] = step;
+    unlockSeq();
+    Serial.printf("[SEQ] Step %d: WAIT_BB  sensor=%d  expect=%s  mode=%s",
+                  numSteps-1, step.bbSensor,
+                  step.bbExpected ? "broken" : "clear",
+                  step.bbWaitMode ? "wait" : "check");
+    if (step.bbWaitMode && step.bbTimeoutMs)
+      Serial.printf("  T=%lums", (unsigned long)step.bbTimeoutMs);
+    if (step.stepLabel) Serial.printf("  N=%d", step.stepLabel);
+    if (step.gotoLabel) Serial.printf("  J=%d", step.gotoLabel);
+    Serial.println();
     return;
   }
 
@@ -1901,6 +2091,37 @@ bool readLink(String &out) {
  * sampling is active, keeping the "[LIVE]" line informative.
  */
 
+// Returns the first step index whose stepLabel == label, or -1 if not found.
+// Caller must NOT hold seqMutex.
+int findStepByLabel(uint8_t label) {
+  if (label == 0) return -1;
+  lockSeq();
+  int found = -1;
+  for (int i = 0; i < numSteps; i++) {
+    if (testSequence[i].stepLabel == label) { found = i; break; }
+  }
+  unlockSeq();
+  return found;
+}
+
+// Jump to a labeled step on failure, or pause if the label isn't found / not set.
+// Returns true if we jumped (caller should return from tickTestExecution immediately).
+bool handleFailGoto(const TestStep &step) {
+  if (step.gotoLabel != 0) {
+    int idx = findStepByLabel(step.gotoLabel);
+    if (idx >= 0) {
+      Serial.printf("[TEST] -> goto label %d (step %d)\n", step.gotoLabel, idx);
+      currentStepIdx  = idx;
+      stepInitialized = false;
+      return true;
+    }
+    Serial.printf("[TEST] WARNING: goto label %d not found, pausing.\n", step.gotoLabel);
+  }
+  runState = RunState::PAUSED;
+  stepper.stop();
+  return false;
+}
+
 void tickTestExecution() {
   if (runState != RunState::RUNNING) return;
 
@@ -1940,14 +2161,41 @@ void tickTestExecution() {
           if (cfg.namedPosSet[step.posVarIdx]) tgt = cfg.namedPositions[step.posVarIdx];
           else { Serial.printf("[TEST] WARNING: X%c not set, skip step %d.\n", 'A'+step.posVarIdx, currentStepIdx); valid = false; }
         } else { tgt = step.targetSteps; }
+
+        // Resolve concurrent servo target while cfg is held, then write after unlock
+        float concurrentServoDeg  = -1.f;
+        bool  doConcurrentServo   = false;
+        if (valid && step.servoWithMove) {
+          if (step.servoMoveUseNamed) {
+            if (cfg.servoNamedPosSet[step.servoMoveVarIdx]) {
+              concurrentServoDeg = cfg.servoNamedPositions[step.servoMoveVarIdx];
+              doConcurrentServo  = true;
+            } else {
+              Serial.printf("[TEST] WARNING: S%c not set, skipping concurrent servo on step %d.\n",
+                            'A'+step.servoMoveVarIdx, currentStepIdx);
+            }
+          } else {
+            concurrentServoDeg = step.servoMoveDeg;
+            doConcurrentServo  = true;
+          }
+        }
+
         if (valid) {
           stepper.setMaxSpeed(spd); stepper.setAcceleration(acc); stepper.moveTo(tgt);
-          Serial.printf("[TEST] Step %d: MOVE -> %ld  F%.0f  A%.0f%s\n",
+          Serial.printf("[TEST] Step %d: MOVE -> %ld  F%.0f  A%.0f%s%s\n",
                         currentStepIdx, tgt, spd, acc,
-                        step.lcInMotion ? "  [LC]" : "");
+                        step.lcInMotion ? "  [LC]" : "",
+                        doConcurrentServo ? "  [SERVO]" : "");
         }
         unlockCfg();
         if (!valid) { currentStepIdx++; stepInitialized = false; }
+
+        // Fire servo now (outside cfg lock since servo_writeDegrees acquires it)
+        if (doConcurrentServo) {
+          servo_writeDegrees(concurrentServoDeg);
+          Serial.printf("[TEST] Step %d: SERVO concurrent -> %.1f deg\n",
+                        currentStepIdx, concurrentServoDeg);
+        }
 
         // Reset in-motion LC state
         lcLastRateMs = millis();
@@ -2000,6 +2248,41 @@ void tickTestExecution() {
         g_velocityCommand  = 0.f;
         Serial.printf("[TEST] Step %d: SEEK_FORCE target=%.4f  Vmax=%.0f creep=%.0f\n",
                       currentStepIdx, step.sfTarget, step.sfMaxSps, step.sfCreepSps);
+        return;
+
+      case StepType::SERVO_MOVE: {
+        // Fire-and-forget: resolve position, write servo, advance immediately
+        float deg;
+        bool doMove = true;
+        if (step.servoUseNamed) {
+          lockCfg();
+          bool isSet = cfg.servoNamedPosSet[step.servoVarIdx];
+          deg        = cfg.servoNamedPositions[step.servoVarIdx];
+          unlockCfg();
+          if (!isSet) {
+            Serial.printf("[TEST] WARNING: S%c not set, skip step %d.\n",
+                          'A'+step.servoVarIdx, currentStepIdx);
+            doMove = false;
+          }
+        } else {
+          deg = step.servoDeg;
+        }
+        if (doMove) {
+          servo_writeDegrees(deg);
+          Serial.printf("[TEST] Step %d: SERVO_MOVE -> %.1f deg\n", currentStepIdx, deg);
+        }
+        currentStepIdx++; stepInitialized = false;
+        return;
+      }
+
+      case StepType::WAIT_BB:
+        Serial.printf("[TEST] Step %d: WAIT_BB  sensor=%d  expect=%s  mode=%s",
+                      currentStepIdx, step.bbSensor,
+                      step.bbExpected ? "broken" : "clear",
+                      step.bbWaitMode ? "wait" : "check");
+        if (step.bbWaitMode && step.bbTimeoutMs)
+          Serial.printf("  timeout=%lums", (unsigned long)step.bbTimeoutMs);
+        Serial.println();
         return;
     }
   }
@@ -2077,18 +2360,63 @@ void tickTestExecution() {
       Serial.printf("[TEST] Step %d: Pos=%ld LC=%.4f\n", currentStepIdx, pos, val);
       LINK_UART.printf("R R pos=%ld lc=%.4f\n", pos, val);  // R = Result (stationary read)
 
-      if (step.checkLimits && cfg.lc_limitsOn) {
+      if (step.checkLimits) {
         lockCfg();
-        bool over = (val > cfg.lc_upperLimit || val < cfg.lc_lowerLimit);
+        bool limitsOn = cfg.lc_limitsOn;
         unlockCfg();
-        if (over) {
-          Serial.println(F("[TEST] LC LIMIT EXCEEDED! Pausing."));
-          runState = RunState::PAUSED; lcLimitTrip = true; stepper.stop(); return;
+        if (limitsOn) {
+          bool over = (val > step.readStepUpperLimit || val < step.readStepLowerLimit);
+          if (over) {
+            Serial.printf("[TEST] LC LIMIT EXCEEDED! (%.4f not in [%.3f, %.3f])\n",
+                          val, step.readStepLowerLimit, step.readStepUpperLimit);
+            lcLimitTrip = true;
+            if (handleFailGoto(step)) return;
+            return;
+          }
         }
       }
       currentStepIdx++; stepInitialized = false;
       break;
     }
+
+    case StepType::WAIT_BB: {
+      BreakBeamSensor &sensor = (step.bbSensor == 2) ? g_break2 : g_break1;
+      bool broken   = sensor.isBroken();
+      bool stateOk  = (broken == step.bbExpected);
+
+      if (step.bbWaitMode) {
+        // Wait-until-right: keep looping until expected state or timeout
+        if (stateOk) {
+          Serial.printf("[TEST] Step %d: BB%d reached expected state (%s).\n",
+                        currentStepIdx, step.bbSensor, broken ? "broken" : "clear");
+          currentStepIdx++; stepInitialized = false;
+        } else if (step.bbTimeoutMs > 0 && (millis() - stepStartMs) >= step.bbTimeoutMs) {
+          Serial.printf("[TEST] Step %d: BB%d TIMEOUT (expected %s, got %s).\n",
+                        currentStepIdx, step.bbSensor,
+                        step.bbExpected ? "broken" : "clear",
+                        broken ? "broken" : "clear");
+          if (handleFailGoto(step)) return;
+        }
+        // else: still waiting, stay in this step
+      } else {
+        // Check-once: advance if OK, pause/goto if not
+        if (stateOk) {
+          Serial.printf("[TEST] Step %d: BB%d OK (%s).\n",
+                        currentStepIdx, step.bbSensor, broken ? "broken" : "clear");
+          currentStepIdx++; stepInitialized = false;
+        } else {
+          Serial.printf("[TEST] Step %d: BB%d WRONG STATE! Expected %s, got %s.\n",
+                        currentStepIdx, step.bbSensor,
+                        step.bbExpected ? "broken" : "clear",
+                        broken ? "broken" : "clear");
+          if (handleFailGoto(step)) return;
+        }
+      }
+      break;
+    }
+
+    case StepType::SERVO_MOVE:
+      break;  // handled entirely in init; should not be reached
   }
 }
 
